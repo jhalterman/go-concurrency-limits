@@ -171,9 +171,9 @@ func NewDefaultLimiter(
 	if maxWindowTime < minWindowTime {
 		return nil, fmt.Errorf("minWindowTime must be <= maxWindowTime")
 	}
-	if windowSize < 10 {
-		return nil, fmt.Errorf("windowSize must be >= 10")
-	}
+	// if windowSize < 10 {
+	// 	return nil, fmt.Errorf("windowSize must be >= 10")
+	// }
 
 	inFlight := int64(0)
 

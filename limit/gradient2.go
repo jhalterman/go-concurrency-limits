@@ -188,15 +188,11 @@ func (l *Gradient2Limit) OnSample(startTime int64, rtt int64, inFlight int, didD
 	defer l.mu.Unlock()
 
 	l.commonSampler.Sample(rtt, inFlight, didDrop)
-
-	queueSize := l.queueSizeFunc(int(l.estimatedLimit))
-
 	shortRTT, _ := l.shortRTT.Add(float64(rtt))
 	longRTT, _ := l.longRTT.Add(float64(rtt))
 
 	l.shortRTTSampleListener.AddSample(shortRTT)
 	l.longRTTSampleListener.AddSample(longRTT)
-	l.queueSizeSampleListener.AddSample(float64(queueSize))
 
 	// If the long RTT is substantially larger than the short RTT then reduce the long RTT measurement.
 	// This can happen when latency returns to normal after a prolonged prior of excessive load.  Reducing the
@@ -207,24 +203,34 @@ func (l *Gradient2Limit) OnSample(startTime int64, rtt int64, inFlight int, didD
 		})
 	}
 
-	// Don't grow the limit if we are app limited
-	if float64(inFlight) < l.estimatedLimit/2 {
-		return
-	}
-
 	// Rtt could be higher than rtt_noload because of smoothing rtt noload updates
 	// so set to 1.0 to indicate no queuing.  Otherwise calculate the slope and don't
 	// allow it to be reduced by more than half to avoid aggressive load-shedding due to
 	// outliers.
+	// including a tolerance of 1.5 just means gradient is more likely to be 1, so if we include a queue, the limit increases faster
 	gradient := math.Max(0.5, math.Min(1.0, longRTT/shortRTT))
+
+	queueSize := 0
+	if gradient >= 1 {
+		// Don't grow the limit if we not necessary
+		if float64(inFlight) < l.estimatedLimit/2 {
+			l.logger.Debugf("old limit=%0.2f, inflight=%d, shortRTT=%0.2f ms, longRTT=%0.2f ms",
+				l.estimatedLimit, inFlight, shortRTT/1e6, longRTT/1e6)
+			return
+		}
+
+		queueSize = l.queueSizeFunc(int(l.estimatedLimit))
+		l.queueSizeSampleListener.AddSample(float64(queueSize))
+	}
+
 	newLimit := l.estimatedLimit*gradient + float64(queueSize)
 	newLimit = l.estimatedLimit*(1-l.smoothing) + newLimit*l.smoothing
 	newLimit = math.Max(float64(l.minLimit), math.Min(float64(l.maxLimit), newLimit))
 
-	if newLimit != l.estimatedLimit && l.logger.IsDebugEnabled() {
-		l.logger.Debugf("new limit=%0.2f, shortRTT=%0.2f ms, longRTT=%0.2f ms, queueSize=%d, gradient=%0.2f",
-			newLimit, shortRTT/1e6, longRTT/1e6, queueSize, gradient)
-	}
+	// if newLimit != l.estimatedLimit && l.logger.IsDebugEnabled() {
+	l.logger.Debugf("new limit=%0.2f, inflight=%d, shortRTT=%0.2f ms, longRTT=%0.2f ms, queueSize=%d, gradient=%0.2f",
+		newLimit, inFlight, shortRTT/1e6, longRTT/1e6, queueSize, gradient)
+	// }
 
 	l.estimatedLimit = newLimit
 	l.notifyListeners(int(l.estimatedLimit))
