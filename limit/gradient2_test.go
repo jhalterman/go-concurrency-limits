@@ -1,12 +1,37 @@
 package limit
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
 	"github.com/platinummonkey/go-concurrency-limits/core"
 )
+
+func TestFoo(t *testing.T) {
+	l, _ := NewGradient2Limit(
+		"test",
+		50,
+		0,
+		0,
+		nil,
+		-1,
+		-1,
+		NoopLimitLogger{},
+		core.EmptyMetricRegistryInstance,
+	)
+	l.OnSample(0, 100, 1000, false)
+	fmt.Println(l.EstimatedLimit())
+	l.OnSample(0, 100, 1000, false)
+	fmt.Println(l.EstimatedLimit())
+	l.OnSample(0, 100, 1000, false)
+	fmt.Println(l.EstimatedLimit())
+	l.OnSample(0, 100, 1000, false)
+	fmt.Println(l.EstimatedLimit())
+	l.OnSample(0, 100, 1000, false)
+	fmt.Println(l.EstimatedLimit())
+}
 
 func TestGradient2Limit(t *testing.T) {
 	t.Parallel()
