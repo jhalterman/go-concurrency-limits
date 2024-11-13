@@ -64,10 +64,6 @@ type Gradient2Limit struct {
 	logger    Logger
 	registry  core.MetricRegistry
 
-	stablePeriods   int // Number of consecutive periods with stable latency
-	stableThreshold int // Number of stable periods needed before a growth spurt
-	growthStep      int // Amount to increase limit in each spurt
-
 	covariance *WindowedCovariance
 }
 
@@ -161,9 +157,6 @@ func NewGradient2Limit(
 		logger:                  logger,
 		registry:                registry,
 
-		stableThreshold: 3,
-		growthStep:      5,
-
 		covariance: NewWindowedCovariance(20),
 	}
 
@@ -222,6 +215,11 @@ func (l *Gradient2Limit) OnSample(startTime int64, rtt int64, inFlight int, didD
 	initialGradient := math.Max(0.5, math.Min(1.5, longRTT/shortRTT))
 
 	covariance := l.covariance.Add(float64(inFlight), shortRTT)
+	if covariance > 0 {
+		covariance = 1
+	} else if covariance < 0 {
+		covariance = -1
+	}
 
 	// Use covariance to adjust gradient
 	gradient := initialGradient
@@ -246,13 +244,13 @@ func (l *Gradient2Limit) OnSample(startTime int64, rtt int64, inFlight int, didD
 
 	// Don't grow the limit if we not necessary
 	if newLimit > float64(inFlight)*10 {
-		l.logger.Debugf("old limit=%0.2f, inflight=%d, covariance=%0.2f, shortRTT=%0.2f ms, longRTT=%0.2f ms",
-			l.estimatedLimit, inFlight, covariance, shortRTT/1e6, longRTT/1e6)
+		l.logger.Debugf("old limit=%0.2f, inflight=%d, shortRTT=%0.2f ms, longRTT=%0.2f ms, covariance=%d, gradient=%0.2f",
+			l.estimatedLimit, inFlight, shortRTT/1e6, longRTT/1e6, int(covariance), gradient)
 		return
 	}
 
-	l.logger.Debugf("new limit=%0.2f, inflight=%d, covariance=%0.2f, shortRTT=%0.2f ms, longRTT=%0.2f ms, queueSize=%d, initialGradient=%0.2f, gradient=%0.2f",
-		newLimit, inFlight, covariance, shortRTT/1e6, longRTT/1e6, queueSize, initialGradient, gradient)
+	l.logger.Debugf("new limit=%0.2f, inflight=%d, shortRTT=%0.2f ms, longRTT=%0.2f ms, covariance=%d, queueSize=%d, initialGradient=%0.2f, gradient=%0.2f",
+		newLimit, inFlight, shortRTT/1e6, longRTT/1e6, int(covariance), queueSize, initialGradient, gradient)
 
 	l.estimatedLimit = newLimit
 	l.notifyListeners(int(l.estimatedLimit))
