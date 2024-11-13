@@ -24,7 +24,7 @@ import (
 //     // Calculate the new limit by applying the gradient and allowing for some queuing
 //     newLimit = gradient * currentLimit + queueSize;
 //
-//     // Update the limit using a smoothing factor (default 0.2)
+//     // Add the limit using a smoothing factor (default 0.2)
 //     newLimit = currentLimit * (1-smoothing) + newLimit * smoothing
 //
 // The limit can be in one of three main states
@@ -68,10 +68,7 @@ type Gradient2Limit struct {
 	stableThreshold int // Number of stable periods needed before a growth spurt
 	growthStep      int // Amount to increase limit in each spurt
 
-	inflightHistory  []float64
-	rttHistory       []float64
-	covarianceWindow int
-	covariance       *CovarianceCalculator
+	covariance *WindowedCovariance
 }
 
 // NewDefaultGradient2Limit create a default Gradient2Limit
@@ -167,8 +164,7 @@ func NewGradient2Limit(
 		stableThreshold: 3,
 		growthStep:      5,
 
-		covarianceWindow: 20,
-		covariance:       NewCovarianceCalculator(50),
+		covariance: NewWindowedCovariance(20),
 	}
 
 	l.commonSampler = core.NewCommonMetricSamplerOrNil(registry, l, name, tags...)
@@ -213,7 +209,7 @@ func (l *Gradient2Limit) OnSample(startTime int64, rtt int64, inFlight int, didD
 	// This can happen when latency returns to normal after a prolonged prior of excessive load.  Reducing the
 	// long RTT without waiting for the exponential smoothing helps bring the system back to steady state.
 	// if (longRTT / shortRTT) > 2 {
-	// 	l.longRTT.Update(func(value float64) float64 {
+	// 	l.longRTT.Add(func(value float64) float64 {
 	// 		return value * 0.9
 	// 	})
 	// }
@@ -225,19 +221,7 @@ func (l *Gradient2Limit) OnSample(startTime int64, rtt int64, inFlight int, didD
 	// including a tolerance of 1.5 just means gradient is more likely to be 1, so if we include a queue, the limit increases faster
 	initialGradient := math.Max(0.5, math.Min(1.5, longRTT/shortRTT))
 
-	// Covariance calculation
-	l.inflightHistory = append(l.inflightHistory, float64(inFlight))
-	l.rttHistory = append(l.rttHistory, shortRTT)
-
-	if len(l.inflightHistory) > l.covarianceWindow {
-		l.inflightHistory = l.inflightHistory[1:]
-		l.rttHistory = l.rttHistory[1:]
-	}
-
-	// covariance := calculateCovariance(l.inflightHistory, l.rttHistory)
-	// covariance := l.covariance.Update(float64(inFlight), shortRTT)
-	covariance := calculateCovariance(l.inflightHistory, l.rttHistory)
-
+	covariance := l.covariance.Add(float64(inFlight), shortRTT)
 
 	// Use covariance to adjust gradient
 	gradient := initialGradient
@@ -251,12 +235,7 @@ func (l *Gradient2Limit) OnSample(startTime int64, rtt int64, inFlight int, didD
 
 	queueSize := 0
 	// if gradient >= 1.0 {
-	// Don't grow the limit if we not necessary
-	if float64(inFlight) > l.estimatedLimit*10 {
-		l.logger.Debugf("old limit=%0.2f, inflight=%d, covariance=%0.2f, shortRTT=%0.2f ms, longRTT=%0.2f ms",
-			l.estimatedLimit, inFlight, covariance, shortRTT/1e6, longRTT/1e6)
-		return
-	}
+
 	queueSize = l.queueSizeFunc(int(l.estimatedLimit))
 	queueSize = 0
 	l.queueSizeSampleListener.AddSample(float64(queueSize))
@@ -265,6 +244,13 @@ func (l *Gradient2Limit) OnSample(startTime int64, rtt int64, inFlight int, didD
 	newLimit = l.estimatedLimit*(1-l.smoothing) + newLimit*l.smoothing
 	newLimit = math.Max(float64(l.minLimit), math.Min(float64(l.maxLimit), newLimit))
 
+	// Don't grow the limit if we not necessary
+	if newLimit > float64(inFlight)*10 {
+		l.logger.Debugf("old limit=%0.2f, inflight=%d, covariance=%0.2f, shortRTT=%0.2f ms, longRTT=%0.2f ms",
+			l.estimatedLimit, inFlight, covariance, shortRTT/1e6, longRTT/1e6)
+		return
+	}
+
 	l.logger.Debugf("new limit=%0.2f, inflight=%d, covariance=%0.2f, shortRTT=%0.2f ms, longRTT=%0.2f ms, queueSize=%d, initialGradient=%0.2f, gradient=%0.2f",
 		newLimit, inFlight, covariance, shortRTT/1e6, longRTT/1e6, queueSize, initialGradient, gradient)
 
@@ -272,77 +258,57 @@ func (l *Gradient2Limit) OnSample(startTime int64, rtt int64, inFlight int, didD
 	l.notifyListeners(int(l.estimatedLimit))
 }
 
-type CovarianceCalculator struct {
-	sumX       float64
-	sumY       float64
-	sumXY      float64
-	sumX2      float64
-	sumY2      float64
-	n          int
+type WindowedCovariance struct {
 	windowSize int
-	samples    []Sample
+
+	// Mutable state
+	sampleCount int
+	sumX        float64
+	sumY        float64
+	sumXY       float64
+	sumX2       float64
+	sumY2       float64
+	xSamples    []float64
+	ySamples    []float64
+	index       int
 }
 
-// Sample represents an individual (x, y) data pair.
-type Sample struct {
-	x float64
-	y float64
-}
-
-// NewCovarianceCalculator initializes a new CovarianceCalculator with a specified window size.
-func NewCovarianceCalculator(windowSize int) *CovarianceCalculator {
-	return &CovarianceCalculator{
+func NewWindowedCovariance(windowSize int) *WindowedCovariance {
+	return &WindowedCovariance{
 		windowSize: windowSize,
-		samples:    make([]Sample, 0, windowSize),
+		xSamples:   make([]float64, windowSize),
+		ySamples:   make([]float64, windowSize),
 	}
 }
 
-// Update updates the covariance with a new pair of (x, y) values, maintaining the window size.
-func (c *CovarianceCalculator) Update(x, y float64) float64 {
-	// Add the new sample
-	c.samples = append(c.samples, Sample{x, y})
+// Add adds the x and y values to the covariance window and returns the current covariance.
+func (c *WindowedCovariance) Add(x, y float64) float64 {
+	if c.sampleCount < c.windowSize {
+		c.sampleCount++
+	} else {
+		oldX := c.xSamples[c.index]
+		oldY := c.ySamples[c.index]
+		c.sumX -= oldX
+		c.sumY -= oldY
+		c.sumXY -= oldX * oldY
+		c.sumX2 -= oldX * oldX
+		c.sumY2 -= oldY * oldY
+	}
+
+	c.xSamples[c.index] = x
+	c.ySamples[c.index] = y
 	c.sumX += x
 	c.sumY += y
 	c.sumXY += x * y
 	c.sumX2 += x * x
 	c.sumY2 += y * y
-	c.n++
 
-	// If the window size exceeds, remove the oldest sample
-	if c.n > c.windowSize {
-		oldSample := c.samples[0]
-		c.samples = c.samples[1:] // Remove the oldest sample
-		c.sumX -= oldSample.x
-		c.sumY -= oldSample.y
-		c.sumXY -= oldSample.x * oldSample.y
-		c.sumX2 -= oldSample.x * oldSample.x
-		c.sumY2 -= oldSample.y * oldSample.y
-		c.n-- // Decrease count to maintain window size
-	}
+	c.index = (c.index + 1) % c.windowSize
 
-	// Calculate covariance
-	covariance := (c.sumXY - (c.sumX * c.sumY / float64(c.n))) / float64(c.n)
-	return covariance
-}
-
-func calculateCovariance(x, y []float64) float64 {
-	if len(x) != len(y) || len(x) < 2 {
+	if c.sampleCount < 2 {
 		return 0
 	}
-
-	var sumX, sumY, sumXY, sumX2, sumY2 float64
-	n := float64(len(x))
-
-	for i := 0; i < len(x); i++ {
-		sumX += x[i]
-		sumY += y[i]
-		sumXY += x[i] * y[i]
-		sumX2 += x[i] * x[i]
-		sumY2 += y[i] * y[i]
-	}
-
-	covariance := (sumXY - (sumX * sumY / n)) / n
-	return covariance
+	return (c.sumXY - (c.sumX * c.sumY / float64(c.sampleCount))) / float64(c.sampleCount)
 }
 
 func (l *Gradient2Limit) String() string {
