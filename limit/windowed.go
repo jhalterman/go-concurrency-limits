@@ -73,9 +73,9 @@ func NewWindowedLimit(
 		return nil, fmt.Errorf("maxWindowTime must be >= 100 ms")
 	}
 
-	if windowSize < 10 {
-		return nil, fmt.Errorf("windowSize must be >= 10 ms")
-	}
+	// if windowSize < 10 {
+	// 	return nil, fmt.Errorf("windowSize must be >= 10 ms")
+	// }
 
 	if delegate == nil {
 		return nil, fmt.Errorf("delegate must be specified")
